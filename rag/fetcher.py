@@ -1,41 +1,67 @@
 """
-embedder.py
------------
-Builds a FAISS vector index from text chunks using sentence-transformers.
+fetcher.py
+----------
+Fetches real stock data using yfinance (free, no API key needed)
+and converts each trading day into a plain-English text chunk for RAG.
 """
 
+import yfinance as yf
+import pandas as pd
 from typing import List, Tuple
-import numpy as np
-import faiss
-from sentence_transformers import SentenceTransformer
-
-_MODEL_NAME = "all-MiniLM-L6-v2"
-_model = None   # lazy-load so startup is fast
 
 
-def _get_model() -> SentenceTransformer:
-    global _model
-    if _model is None:
-        _model = SentenceTransformer(_MODEL_NAME)
-    return _model
+def fetch_stock_data(
+    ticker: str, period: str = "1y"
+) -> Tuple[pd.DataFrame | None, List[str]]:
+    """
+    Download OHLCV data for a ticker and convert to text chunks.
+
+    Args:
+        ticker: Stock symbol e.g. "AAPL"
+        period: yfinance period string e.g. "1y", "6mo", "2y"
+
+    Returns:
+        (DataFrame with OHLCV data, list of plain-English day descriptions)
+    """
+    try:
+        df = yf.download(ticker, period=period, progress=False, auto_adjust=True)
+        if df.empty:
+            return None, []
+
+        # Flatten multi-level columns if present
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+
+        df = df.dropna()
+        chunks = _build_chunks(df, ticker)
+        return df, chunks
+
+    except Exception as e:
+        print(f"Error fetching {ticker}: {e}")
+        return None, []
 
 
-def build_index(chunks: List[str]) -> faiss.IndexFlatL2:
-    """Embed all chunks and build a FAISS index."""
-    model = _get_model()
-    embeddings = model.encode(chunks, show_progress_bar=False, convert_to_numpy=True)
-    embeddings = embeddings.astype(np.float32)
+def _build_chunks(df: pd.DataFrame, ticker: str) -> List[str]:
+    """
+    Convert each row of the OHLCV dataframe into a natural language description.
+    These become the documents that get embedded and searched.
+    """
+    chunks = []
 
-    index = faiss.IndexFlatL2(embeddings.shape[1])
-    index.add(embeddings)
-    return index
+    for date, row in df.iterrows():
+        date_str  = date.strftime("%B %d, %Y")        # e.g. "June 03, 2024"
+        day_change = row["Close"] - row["Open"]
+        direction  = "up" if day_change >= 0 else "down"
+        pct_change = (day_change / row["Open"]) * 100
 
+        text = (
+            f"On {date_str}, {ticker} stock opened at ${row['Open']:.2f}, "
+            f"reached a high of ${row['High']:.2f}, a low of ${row['Low']:.2f}, "
+            f"and closed at ${row['Close']:.2f}. "
+            f"The stock moved {direction} by ${abs(day_change):.2f} "
+            f"({abs(pct_change):.2f}%) on the day. "
+            f"Trading volume was {int(row['Volume']):,} shares."
+        )
+        chunks.append(text)
 
-def search_index(
-    query: str, index: faiss.IndexFlatL2, chunks: List[str], top_k: int = 8
-) -> List[str]:
-    """Return the top-k most relevant chunks for a query."""
-    model = _get_model()
-    q_emb = model.encode([query], convert_to_numpy=True).astype(np.float32)
-    _, indices = index.search(q_emb, top_k)
-    return [chunks[i] for i in indices[0] if 0 <= i < len(chunks)]
+    return chunks
